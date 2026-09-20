@@ -46,6 +46,70 @@ function buildQuestions(state) {
 	};
 }
 
+// エージェント行動前ゲート（Chris記事 方法③）: 破壊的/金を使う操作の前に判定
+function buildGuardQuestions(state) {
+	return {
+		duplicate: {
+			type: "noul",
+			instructions: "Is this action a duplicate of something already done in the recent history?",
+		},
+		off_goal: {
+			type: "noul",
+			instructions: "Is this action off-goal relative to today's stated objective?",
+		},
+		may_spend: {
+			type: "choice",
+			instructions: "May this agent action proceed?",
+			criteria: {
+				approve: "Safe, normal, low-risk, reversible",
+				review: "Borderline, uncertain, needs a human check",
+				deny: "Dangerous, off-goal, duplicate, too expensive, or destructive",
+			},
+		},
+		undoable: {
+			type: "noul",
+			instructions: "Can this action be easily undone (reversible) if it goes wrong?",
+		},
+		last_ok: {
+			type: "noul",
+			instructions: "Did the agent's last recorded step actually succeed?",
+		},
+		lead_real: state.lead
+			? {
+					type: "noul",
+					instructions: "Is this lead real (a genuine human enquiry), not spam or a bot?",
+				}
+			: null,
+	};
+}
+
+function guardDecision(a) {
+	const spend = a.may_spend?.choice;
+	const conf = a.may_spend?.confidence ?? 0;
+	const offGoal = a.off_goal?.noul ?? 0;
+	const dup = a.duplicate?.noul ?? 0;
+	const undoable = a.undoable?.noul ?? 0;
+	let verdict;
+	if (spend === "deny") {
+		// Jevが明確に危険/ゴール外/破壊的と判断 → 常に止める
+		verdict = "block";
+	} else if (spend === "review" || conf < 0.7) {
+		// Jevが境界線と判断、または低信頼 → 人に確認
+		verdict = "review";
+	} else {
+		// spend=approve のときは、Jevが「この行動は安全」と明示した場合。
+		// off_goal は「ゴール外の可能性」だが、approve(安全)なら直接blockしない。
+		// ただし極端にゴール外(>=0.9) or ほぼ確実な重複(>=0.9) で、かつ
+		// やり直し不可(undoable<0.5)の場合は、安全側に倒して review。
+		if ((offGoal >= 0.9 || dup >= 0.9) && undoable < 0.5) {
+			verdict = "review";
+		} else {
+			verdict = "approve";
+		}
+	}
+	return { verdict, spend, confidence: conf, off_goal: offGoal, duplicate: dup, undoable, last_ok: a.last_ok?.noul ?? null, lead_real: a.lead_real?.noul ?? null };
+}
+
 // 静的デモページ（英語・判断APIを試せる）
 const DEMO_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -246,6 +310,48 @@ export default {
 						risk: { score: a.risk?.noul },
 					},
 					note: "Judgment proposal only. No money movement.",
+				});
+			} catch (e) {
+				return Response.json({ error: "Jev call failed", detail: String(e) }, { status: 502 });
+			}
+		}
+
+		// ==== エージェント行動前ガード（Chris記事 方法③）====
+		if (url.pathname === "/guard" && request.method === "POST") {
+			if (!env.TYPESAFE_API_KEY) {
+				return Response.json({ error: "TYPESAFE_API_KEY not configured (Cloudflare secret)" }, { status: 503 });
+			}
+			let body;
+			try { body = await request.json(); } catch { return Response.json({ error: "invalid json" }, { status: 400 }); }
+			const action = (body.action || "").toString().trim();
+			if (!action) { return Response.json({ error: "action required" }, { status: 400 }); }
+
+			const state = {
+				action,
+				cost: body.cost ?? "unknown",
+				touches: body.touches || "internal",
+				last_ten_actions: body.lastActions || body.history || [],
+				today_goal: body.goal || "",
+				lead: body.lead || null,
+			};
+
+			const qs = buildGuardQuestions(state);
+			// leadがなければlead_real質問を除去
+			delete qs.lead_real;
+			const payload = { model: "jev-latest", state, questions: qs };
+
+			try {
+				const resp = await fetch(ENDPOINT, {
+					method: "POST",
+					headers: { "Content-Type": "application/json", Authorization: `Bearer ${env.TYPESAFE_API_KEY}` },
+					body: JSON.stringify(payload),
+				});
+				if (!resp.ok) return Response.json({ error: "Jev upstream error", status: resp.status }, { status: 502 });
+				const data = await resp.json();
+				const a = data.answers || {};
+				return Response.json({
+					guard: guardDecision(a),
+					note: "Judgment proposal only. Never moves money or executes the action by itself.",
 				});
 			} catch (e) {
 				return Response.json({ error: "Jev call failed", detail: String(e) }, { status: 502 });
