@@ -358,6 +358,57 @@ export default {
 			}
 		}
 
+		// ==== カード払い（従来課金・Stripe Payment Link / Checkout Session）====
+		// 人間もエージェントもカードで払える。キーは .env / Cloudflare secret から読む。
+		if (url.pathname === "/checkout" && request.method === "POST") {
+			const sk = env.STRIPE_SECRET_KEY || "";
+			if (!sk) {
+				return Response.json(
+					{ error: "STRIPE_SECRET_KEY not configured. Ask the owner to set it as a Cloudflare secret." },
+					{ status: 503 }
+				);
+			}
+			let body;
+			try { body = await request.json(); } catch { return Response.json({ error: "invalid json" }, { status: 400 }); }
+			// 商品/価格を指定（無ければ Guard Skill $29/mo の既定価格ID）
+			const priceId = body.priceId || env.STRIPE_GUARD_PRICE_ID || "";
+			if (!priceId) {
+				return Response.json({ error: "priceId required. Set STRIPE_GUARD_PRICE_ID secret with the Guard-Skill price." }, { status: 400 });
+			}
+			try {
+				// Checkout Session（カード決済）をStripe APIで作成
+				const resp = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/x-www-form-urlencoded",
+						Authorization: `Bearer ${sk}`,
+					},
+					body: (() => {
+						const p = new URLSearchParams();
+						p.set("mode", "subscription");
+						p.set("line_items[0][price]", priceId);
+						p.set("line_items[0][quantity]", "1");
+						p.set("success_url", (body.successUrl || env.CHECKOUT_SUCCESS_URL || "https://decision-kernel.pickaxe.workers.dev/?paid=1").replace(/&/g, "%26").replace(/"/g, "%22"));
+						p.set("cancel_url", "https://decision-kernel.pickaxe.workers.dev/");
+						return p.toString();
+					})(),
+				});
+				if (!resp.ok) {
+					return Response.json({ error: "Stripe upstream error", status: resp.status }, { status: 502 });
+				}
+				const data = await resp.json();
+				// エージェント向け: Payment Link / 人間向け: Checkout URL
+				return Response.json({
+					checkout_url: data.url,
+					payment_link: null,
+					note: "Card payment via Stripe. No money is moved by this Worker; Stripe handles settlement.",
+				});
+			} catch (e) {
+				return Response.json({ error: "Stripe call failed", detail: String(e) }, { status: 502 });
+			}
+		}
+
 		return Response.json({ error: "not found" }, { status: 404 });
+
 	},
 };
